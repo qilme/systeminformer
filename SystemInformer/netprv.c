@@ -160,6 +160,8 @@ VOID NTAPI PhpNetworkItemDeleteProcedure(
         PhDereferenceObject(networkItem->LocalHostString);
     if (networkItem->RemoteHostString)
         PhDereferenceObject(networkItem->RemoteHostString);
+    if (networkItem->HvService)
+        PhDereferenceObject(networkItem->HvService);
 
     // NOTE: Dereferencing the ProcessItem will destroy the NetworkItem->ProcessIcon handle.
     if (networkItem->ProcessItem)
@@ -462,6 +464,146 @@ PPHP_RESOLVE_CACHE_ITEM PhpLookupResolveCacheItem(
 //    return hostName;
 //}
 
+BOOLEAN PhpHvAddressIsVSockTemplate(
+    _In_ PGUID HvAddr
+    )
+{
+    GUID template = *HvAddr;
+
+    template.Data1 = 0;
+
+    return !!IsEqualGUID(&template, &HV_GUID_VSOCK_TEMPLATE);
+}
+
+PPH_STRING PhpGetHvHostName(
+    _In_ PGUID HvAddr
+    )
+{
+    static const PH_STRINGREF hvComputeSystemKey = PH_STRINGREF_INIT(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\HostComputeService\\VolatileStore\\ComputeSystem\\");
+    static const PH_STRINGREF trimSet = PH_STRINGREF_INIT(L"{}");
+    PPH_STRING hostName = NULL;
+    PPH_STRING guidString;
+    PH_STRINGREF guidStringTrimmed;
+    PPH_STRING keyName;
+    HANDLE keyHandle;
+
+    guidString = PhFormatGuid(HvAddr);
+    guidStringTrimmed = guidString->sr;
+    PhTrimStringRef(&guidStringTrimmed, &trimSet, 0);
+
+    keyName = PhConcatStringRef2(&hvComputeSystemKey, &guidStringTrimmed);
+
+    if (NT_SUCCESS(PhOpenKey(
+        &keyHandle,
+        KEY_QUERY_VALUE,
+        PH_KEY_LOCAL_MACHINE,
+        &keyName->sr,
+        0
+        )))
+    {
+        PPH_STRING vmName;
+
+        if (vmName = PhQueryRegistryStringZ(keyHandle, L"VmName"))
+            PhMoveReference(&hostName, vmName);
+        else if (vmName = PhQueryRegistryStringZ(keyHandle, L"VmId"))
+            PhMoveReference(&hostName, vmName);
+        else
+            PhMoveReference(&hostName, PhCreateString3(&guidStringTrimmed, PH_STRING_UPPER_CASE, NULL));
+
+        NtClose(keyHandle);
+    }
+
+    PhDereferenceObject(keyName);
+    PhDereferenceObject(guidString);
+
+    return hostName;
+}
+
+PPH_STRING PhpGetHvServiceName(
+    _In_ PGUID HvAddr
+    )
+{
+    static const PH_STRINGREF hvGuestServicesKey = PH_STRINGREF_INIT(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Virtualization\\GuestCommunicationServices\\");
+    static const PH_STRINGREF trimSet = PH_STRINGREF_INIT(L"{}");
+    PPH_STRING serviceName = NULL;
+    PPH_STRING guidString;
+    PH_STRINGREF guidStringTrimmed;
+    PPH_STRING keyName;
+    HANDLE keyHandle;
+
+    guidString = PhFormatGuid(HvAddr);
+    guidStringTrimmed = guidString->sr;
+    PhTrimStringRef(&guidStringTrimmed, &trimSet, 0);
+
+    keyName = PhConcatStringRef2(&hvGuestServicesKey, &guidStringTrimmed);
+
+    if (NT_SUCCESS(PhOpenKey(
+        &keyHandle,
+        KEY_QUERY_VALUE,
+        PH_KEY_LOCAL_MACHINE,
+        &keyName->sr,
+        0
+        )))
+    {
+        PPH_STRING elementName;
+
+        if (elementName = PhQueryRegistryStringZ(keyHandle, L"ElementName"))
+            PhMoveReference(&serviceName, elementName);
+
+        NtClose(keyHandle);
+    }
+
+    // Keep this after element name lookup. Certain services define the VSOCK
+    // template with a specific port (e.g. Docker). (jxy-s)
+    if (!serviceName && PhpHvAddressIsVSockTemplate(HvAddr))
+        PhMoveReference(&serviceName, PhCreateString(L"VSOCK"));
+
+    PhDereferenceObject(keyName);
+    PhDereferenceObject(guidString);
+
+    return serviceName;
+}
+
+PPH_STRING PhpGetHvAddressString(
+    _In_ PGUID HvAddr
+    )
+{
+    static PH_INITONCE initOnce = PH_INITONCE_INIT;
+    static PPH_STRING wildcardString;
+    static PPH_STRING broadcastString;
+    static PPH_STRING childrenString;
+    static PPH_STRING loopbackString;
+    static PPH_STRING hostString;
+    static PPH_STRING siloHostString;
+    PPH_STRING addressString = NULL;
+
+    if (PhBeginInitOnce(&initOnce))
+    {
+        wildcardString = PhCreateString(L"*");
+        broadcastString = PhCreateString(L"Broadcast");
+        childrenString = PhCreateString(L"Children");
+        loopbackString = PhCreateString(L"Loopback");
+        hostString = PhCreateString(L"Host");
+        siloHostString = PhCreateString(L"Silo Host");
+        PhEndInitOnce(&initOnce);
+    }
+
+    if (IsEqualGUID(HvAddr, &HV_GUID_WILDCARD))
+        return PhReferenceObject(wildcardString);
+    if (IsEqualGUID(HvAddr, &HV_GUID_BROADCAST))
+        return PhReferenceObject(broadcastString);
+    if (IsEqualGUID(HvAddr, &HV_GUID_CHILDREN))
+        return PhReferenceObject(childrenString);
+    if (IsEqualGUID(HvAddr, &HV_GUID_LOOPBACK))
+        return PhReferenceObject(loopbackString);
+    if (IsEqualGUID(HvAddr, &HV_GUID_PARENT))
+        return PhReferenceObject(hostString);
+    if (IsEqualGUID(HvAddr, &HV_GUID_SILOHOST))
+        return PhReferenceObject(siloHostString);
+
+    return PhFormatGuid(HvAddr);
+}
+
 PPH_STRING PhpGetDnsReverseNameFromAddress(
     _In_ PPH_IP_ADDRESS Address
     )
@@ -609,6 +751,8 @@ PPH_STRING PhGetHostNameFromAddressEx(
             dnsReverseNameString = PhDnsReverseLookupNameFromAddress(PH_NETWORK_TYPE_IPV6, &Address->In6Addr);
         }
         break;
+    case PH_NETWORK_TYPE_HYPERV:
+        return PhpGetHvHostName(&Address->HvAddr);
     }
 
     if (PhIsNullOrEmptyString(dnsReverseNameString))
@@ -1066,7 +1210,10 @@ VOID PhNetworkProviderUpdate(
                 break;
             case PH_NETWORK_TYPE_HYPERV:
                 {
-                    networkItem->LocalAddressString = PhFormatGuid(
+                    networkItem->LocalAddressString = PhpGetHvAddressString(
+                        &networkItem->LocalEndpoint.Address.HvAddr
+                        );
+                    networkItem->HvService = PhpGetHvServiceName(
                         &networkItem->LocalEndpoint.Address.HvAddr
                         );
                 }
@@ -1122,7 +1269,7 @@ VOID PhNetworkProviderUpdate(
                 break;
             case PH_NETWORK_TYPE_HYPERV:
                 {
-                    networkItem->RemoteAddressString = PhFormatGuid(
+                    networkItem->RemoteAddressString = PhpGetHvAddressString(
                         &networkItem->RemoteEndpoint.Address.HvAddr
                         );
                 }
@@ -1298,7 +1445,7 @@ PHVSOCKET_CONNECTIONS PhpGetHvSocketConnections(
     for (;;)
     {
         status = HvSocketGetConnections(SystemHandle, VmId, connections, length, &length);
-        if (status != STATUS_BUFFER_TOO_SMALL)
+        if (status != STATUS_BUFFER_TOO_SMALL || length == 0)
         {
             break;
         }
@@ -1316,7 +1463,9 @@ PHVSOCKET_CONNECTIONS PhpGetHvSocketConnections(
     return connections;
 }
 
-VOID PhpGetHvSocket(
+VOID PhpCollectHvSocket(
+    _In_ PGUID VmIds,
+    _In_ SIZE_T Count,
     _Out_ PHVSOCKET_LISTENERS* Listeners,
     _Out_ PHVSOCKET_CONNECTIONS* Connections
     )
@@ -1341,68 +1490,23 @@ VOID PhpGetHvSocket(
     listenersList = PhCreateList(1);
     connectionsList = PhCreateList(1);
 
-    listeners = PhpGetHvSocketListeners(systemHandle, &HV_GUID_ZERO);
-    connections = PhpGetHvSocketConnections(systemHandle, &HV_GUID_ZERO);
-
-    if (listeners)
+    for (ULONG i = 0; i < Count; i++)
     {
-        for (ULONG i = 0; i < listeners->Count; i++)
+        if (listeners = PhpGetHvSocketListeners(systemHandle, &VmIds[i]))
         {
-            PHVSOCKET_LISTENERS l;
-            PHVSOCKET_CONNECTIONS c;
-
-            if (IsEqualGUID(&listeners->Listener[i].VmId, &HV_GUID_ZERO))
-                continue;
-
-            l = PhpGetHvSocketListeners(systemHandle, &listeners->Listener[i].VmId);
-            if (l)
-            {
-                listenersCount += l->Count;
-                PhAddItemList(listenersList, l);
-            }
-
-            c = PhpGetHvSocketConnections(systemHandle, &listeners->Listener[i].VmId);
-            if (c)
-            {
-                connectionsCount += c->Count;
-                PhAddItemList(connectionsList, c);
-            }
+            PhAddItemList(listenersList, listeners);
+            listenersCount += listeners->Count;
         }
 
-        listenersCount += listeners->Count;
-        PhAddItemList(listenersList, listeners);
-        listeners = NULL;
-    }
-
-    if (connections)
-    {
-        for (ULONG i = 0; i < connections->Count; i++)
+        if (connections = PhpGetHvSocketConnections(systemHandle, &VmIds[i]))
         {
-            PHVSOCKET_LISTENERS l;
-            PHVSOCKET_CONNECTIONS c;
-
-            if (IsEqualGUID(&connections->Connection[i].VmId, &HV_GUID_ZERO))
-                continue;
-
-            l = PhpGetHvSocketListeners(systemHandle, &connections->Connection[i].VmId);
-            if (l)
-            {
-                listenersCount += l->Count;
-                PhAddItemList(listenersList, l);
-            }
-
-            c = PhpGetHvSocketConnections(systemHandle, &connections->Connection[i].VmId);
-            if (c)
-            {
-                connectionsCount += c->Count;
-                PhAddItemList(connectionsList, c);
-            }
+            PhAddItemList(connectionsList, connections);
+            connectionsCount += connections->Count;
         }
-
-        connectionsCount += connections->Count;
-        PhAddItemList(connectionsList, connections);
-        connections = NULL;
     }
+
+    listeners = NULL;
+    connections = NULL;
 
     if (listenersCount)
     {
@@ -1469,6 +1573,74 @@ VOID PhpGetHvSocket(
     *Connections = connections;
 
     NtClose(systemHandle);
+}
+
+static BOOLEAN NTAPI PhpHvEnumComputeSystemCallback(
+    _In_ HANDLE RootDirectory,
+    _In_ PKEY_BASIC_INFORMATION Information,
+    _In_ PVOID Context
+    )
+{
+    PPH_ARRAY guidArray = Context;
+    PH_STRINGREF name;
+    PH_FORMAT format[3];
+    PPH_STRING string;
+    GUID guid;
+
+    name.Buffer = Information->Name;
+    name.Length = Information->NameLength;
+
+    PhInitFormatC(&format[0], L'{');
+    PhInitFormatSR(&format[1], name);
+    PhInitFormatC(&format[2], L'}');
+
+    string = PhFormat(format, 3, 10);
+
+    if (NT_SUCCESS(PhStringToGuid(&string->sr, &guid)))
+        PhAddItemArray(guidArray, &guid);
+
+    PhDereferenceObject(string);
+
+    return TRUE;
+}
+
+VOID PhpGetHvSocket(
+    _Out_ PHVSOCKET_LISTENERS* Listeners,
+    _Out_ PHVSOCKET_CONNECTIONS* Connections
+)
+{
+    static const PH_STRINGREF hvComputeSystemKey = PH_STRINGREF_INIT(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\HostComputeService\\VolatileStore\\ComputeSystem");
+    PH_ARRAY guidArray;
+    HANDLE keyHandle;
+
+    PhInitializeArray(&guidArray, sizeof(GUID), 10);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_WILDCARD);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_BROADCAST);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_CHILDREN);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_LOOPBACK);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_PARENT);
+    PhAddItemArray(&guidArray, (PVOID)&HV_GUID_SILOHOST);
+
+    if (NT_SUCCESS(PhOpenKey(
+        &keyHandle,
+        KEY_ENUMERATE_SUB_KEYS,
+        PH_KEY_LOCAL_MACHINE,
+        &hvComputeSystemKey,
+        0
+        )))
+    {
+        PhEnumerateKey(keyHandle, KeyBasicInformation, PhpHvEnumComputeSystemCallback, &guidArray);
+        NtClose(keyHandle);
+    }
+
+    PhpCollectHvSocket(
+        PhFinalArrayItems(&guidArray),
+        PhFinalArrayCount(&guidArray),
+        Listeners,
+        Connections
+        );
+
+    PhDeleteArray(&guidArray);
 }
 #endif // _WIN64
 
@@ -1790,7 +1962,7 @@ BOOLEAN PhGetNetworkConnections(
             connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_HYPERV;
             connections[index].LocalEndpoint.Address.HvAddr = hvListeners->Listener[i].ServiceId;
 
-            if (hvListeners->Listener[i].Port <= 0x7FFFFFFF) // valid port range
+            if (PhpHvAddressIsVSockTemplate(&connections[index].LocalEndpoint.Address.HvAddr))
                 connections[index].LocalEndpoint.Port = hvListeners->Listener[i].Port;
             else
                 connections[index].LocalEndpoint.Port = 0;
@@ -1801,7 +1973,7 @@ BOOLEAN PhGetNetworkConnections(
             connections[index].ProcessId = UlongToHandle(hvListeners->Listener[i].ProcessId);
             connections[index].CreateTime = hvListeners->Listener[i].TimeStamp;
 
-            connections[index].State = MIB_TCP_STATE_LISTEN;
+            connections[index].State = 0; // HACK
 
             index++;
         }
@@ -1818,7 +1990,7 @@ BOOLEAN PhGetNetworkConnections(
             connections[index].LocalEndpoint.Address.Type = PH_NETWORK_TYPE_HYPERV;
             connections[index].LocalEndpoint.Address.HvAddr = hvConnections->Connection[i].ServiceId;
 
-            if (hvConnections->Connection[i].Port <= 0x7FFFFFFF) // valid port range
+            if (PhpHvAddressIsVSockTemplate(&connections[index].LocalEndpoint.Address.HvAddr))
                 connections[index].LocalEndpoint.Port = hvConnections->Connection[i].Port;
             else
                 connections[index].LocalEndpoint.Port = 0;
